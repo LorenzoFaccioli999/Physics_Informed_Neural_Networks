@@ -27,7 +27,7 @@ $$
 \nabla_{xx} u(x) = f(x), \quad u(0) = u(1) = 0, \quad u(x) = \sin(2\pi x) + 0.1 \sin(50\pi x)
 $$
 
-This PDE is representative of systems exhibiting fine-grained oscillatory behavior. The objective of the Neural Network is to learn the function $f(x)$ from partial, noisy data. Results demonstrate significant improvements in solution accuracy and convergence behavior when using the multi-scale Fourier embedding technique, especially in the presence of noise or when modeling fine-resolution physics. For an in-depth analysis, see the [accompanying report].(https://github.com/LorenzoFaccioli999/Physics_Informed_Neural_Networks/blob/main/PINN_report.pdf)
+This PDE is representative of systems exhibiting fine-grained oscillatory behavior. The objective of the Neural Network is to learn the function $f(x)$ from partial, noisy data. Results demonstrate significant improvements in solution accuracy and convergence behavior when using the multi-scale Fourier embedding technique, especially in the presence of noise or when modeling fine-resolution physics. For an in-depth analysis, see the [accompanying report](https://github.com/LorenzoFaccioli999/Physics_Informed_Neural_Networks/blob/main/PINN_report.pdf).
 
 ## Code Structure
 
