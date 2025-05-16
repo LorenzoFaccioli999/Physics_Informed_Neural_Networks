@@ -31,7 +31,7 @@ This PDE is representative of systems exhibiting fine-grained oscillatory behavi
 
 ## Code Structure
 
-- `pinn_fourier_embedding.py`: Solves 1D multi-frequency PDE using Fourier feature embeddings.
+- `pinn_fourier_embedding.py`: Solves 1D multi-scale multi-frequency PDE using Fourier feature embeddings.
 - `plotting_functions.py`: Utility for 2D/3D visualizations of the predicted and reference solutions.
 
 ## Requirements
