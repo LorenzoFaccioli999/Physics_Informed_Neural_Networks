@@ -1,379 +1,410 @@
-#------------------ Necessary imports --------------------------------
+# =============================================================================
+# PINN with Fourier Embedding - Modular, User-Friendly Version
+# =============================================================================
+# This script implements a Physics-Informed Neural Network (PINN) with Fourier embedding.
+# It is structured for clarity, modularity, and user configurability.
+#
+# Users can:
+#   - Provide their own data (x_train, u_train, x_test, u_test)
+#   - Specify domain boundaries, number of collocation points, and expected frequencies
+#   - The code will encode the data, train the PINN, and plot results
+#   - An example with synthetic data is provided at the end
+#
+# =============================================================================
+
 import torch
 import torch.autograd as autograd
 from torch import Tensor
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-from torch.nn.utils import clip_grad_norm_
 import numpy as np
+import random
+import matplotlib.pyplot as plt
+from pyDOE import lhs # Latin Cube Hypersampling
+import rff
+from pathlib import Path
 
 # ------------------- Reproducibility and Determinism -------------------
-import random
 seed = 42
 torch.manual_seed(seed)
 torch.cuda.manual_seed_all(seed)
 np.random.seed(seed)
 random.seed(seed)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+#torch.backends.cudnn.deterministic = True
+#torch.backends.cudnn.benchmark = False
 
 # ------------------- Precision Control (float32/float64) ---------------
-# Set to torch.float64 for higher precision (slower)
 DTYPE = torch.float32
 torch.set_default_dtype(DTYPE)
 
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-from mpl_toolkits.axes_grid1 import make_axes_locatable
-from mpl_toolkits.mplot3d import Axes3D
-import matplotlib.ticker
-from sklearn.model_selection import train_test_split
-import itertools
-
-import numpy as np
-import time
-from pyDOE import lhs # Latin Cube Hypersampling
-import rff
-
-from plotting_functions import plot3D, plot3D_Matrix
-
-#------------------- Make code device agnostic -----------------------------
-
+# ------------------- Device Selection ----------------------------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
-#---------------------- Generate synthetic data ------------------------------
-
-torch.set_default_dtype(torch.float)
-# defining boundaries of the domain and number of discretization points
-x_min = 0
-x_max = 1
-
-#N_train: Number of training points # N_test: number of test points # Nf: Number of collocation points (Evaluate PDE)
-N_train = 50
-N_test = 200
-Nf = 1000
-def ground_truth(x):
-  return torch.sin(2*np.pi*x) + torch.mul(torch.sin(50*np.pi*x), 0.1)
-
-x_train = torch.linspace(x_min, x_max, N_train).view(-1,1)  #.view is equivalent to .reshape, the resulting tensor has size (N_train, 1)
-x_PDE = torch.from_numpy(x_min+(x_max-x_min)*lhs(1, Nf)).type(torch.float).to(device)
-x_test = torch.linspace(x_min, x_max, N_test).view(-1,1)
-x_bc = torch.Tensor([0,1]).view(-1,1).type(torch.float)
-
-# Ensure all data is on the same device
-x_train = x_train.to(device)
-x_test = x_test.to(device)
-x_bc = x_bc.to(device)
-
-u_train = ground_truth(x_train)
-u_test = ground_truth(x_test)  # evaluating the real function
-u_bc = torch.Tensor([0, 0]).view(-1, 1).type(torch.float)
-# Ensure u_bc is on the same device
-u_bc = u_bc.to(device)
-
-#adding noise to training data
-noise = torch.randn(u_train.shape[0], 1, device=device)
-u_train = u_train + noise
-
-
-
-#------------------------ creating a Neural Network model ----------------------------
+# =============================================================================
+# PINN Model Definition
+# =============================================================================
 def init_weights(m):
-  if isinstance(m, nn.Linear):
-    torch.nn.init.xavier_uniform_(m.weight)
-    if m.bias is not None:
-        nn.init.constant_(m.bias, 0.01)
+    """Xavier initialization for Linear layers."""
+    if isinstance(m, nn.Linear):
+        torch.nn.init.xavier_uniform_(m.weight)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0.01)
 
 class PINN(nn.Module):
-  def __init__(self, hidden_units, input_size):
-    super().__init__()
+    """
+    Physics-Informed Neural Network with Fourier Embedding.
+    """
+    def __init__(self, hidden_units, input_size, fourier_encoder_2, fourier_encoder_50):
+        super().__init__()
+        self.loss_function = nn.MSELoss(reduction='mean')
+        self.input_size = input_size
+        self.fourier_encoder_2 = fourier_encoder_2
+        self.fourier_encoder_50 = fourier_encoder_50
+        self.layer_stack = nn.Sequential(
+            nn.Linear(in_features=self.input_size, out_features=hidden_units),
+            nn.Tanh(),
+            nn.Linear(in_features=hidden_units, out_features=hidden_units),
+            nn.Tanh(),
+            nn.Linear(in_features=hidden_units, out_features=hidden_units),
+            nn.Tanh(),
+            nn.Linear(in_features=hidden_units, out_features=hidden_units),
+            nn.Tanh(),
+            nn.Linear(in_features=hidden_units, out_features=hidden_units),
+            nn.Tanh(),
+            nn.Linear(in_features=hidden_units, out_features=1),
+        )
 
-    self.loss_function = nn.MSELoss(reduction='mean')
-    self.input_size = input_size
+    def lossTrain(self, x_train, u_train):
+        loss_train = self.loss_function(self.forward(x_train), u_train)
+        return loss_train
 
-    # Always initialize on CPU for determinism
-    self.layer_stack = nn.Sequential(
-        nn.Linear(in_features=self.input_size, out_features=hidden_units),
-        nn.Tanh(),
-        nn.Linear(in_features=hidden_units, out_features=hidden_units),
-        nn.Tanh(),
-        nn.Linear(in_features=hidden_units, out_features=hidden_units),
-        nn.Tanh(),
-        nn.Linear(in_features=hidden_units, out_features=hidden_units),
-        nn.Tanh(),
-        nn.Linear(in_features=hidden_units, out_features=hidden_units),
-        nn.Tanh(),
-        nn.Linear(in_features=hidden_units, out_features=1),
+    def lossBC(self, x_bc, u_bc):
+        loss_bc = self.loss_function(self.forward(x_bc), u_bc)
+        return loss_bc
+
+    def lossPDE(self, x_PDE):
+        # Ensure all tensors are on the same device and dtype as x_PDE
+        x = x_PDE.clone().detach().requires_grad_(True)
+        x = x.to(device=x_PDE.device, dtype=x_PDE.dtype)
+        u = self.forward(x)
+        ones_like_u = torch.ones_like(u).to(x.device, dtype=u.dtype)
+        u_x = autograd.grad(u, x, ones_like_u, retain_graph=True, create_graph=True)[0]
+        ones_like_ux = torch.ones_like(u_x).to(x.device, dtype=u_x.dtype)
+        u_xx = autograd.grad(u_x, x, ones_like_ux, create_graph=True)[0]
+        # The PDE below is for the example problem. For custom problems, modify as needed.
+        f = u_xx + torch.mul(torch.sin(2*np.pi*x), 4*np.pi**2) + torch.mul(torch.sin(50*np.pi*x), 250*np.pi**2)
+        zeros_target = torch.zeros(f.shape[0], 1, device=x.device, dtype=f.dtype)
+        return self.loss_function(f, zeros_target)
+
+    def loss(self, x_train, u_train, x_bc, u_bc, x_PDE, weights="static"):
+        loss_pde = self.lossPDE(x_PDE)
+        loss_bc = self.lossBC(x_bc, u_bc)
+        loss_train = self.lossTrain(x_train, u_train)
+        if weights == "static":
+            weight_pde = 1e-2
+            weight_bc = 1e6
+            weight_train = 1
+            total = loss_pde * weight_pde + loss_train * weight_train + loss_bc * weight_bc
+            return loss_train * weight_train, loss_bc * weight_bc, loss_pde * weight_pde, total
+        elif weights == "adaptive simple":
+            s = loss_pde + loss_train + loss_bc
+            weight_pde = loss_pde / s
+            weight_bc = loss_bc / s
+            weight_train = loss_train / s
+            total = loss_pde * weight_pde + loss_train * weight_train + loss_bc * weight_bc
+            return loss_train * weight_train, loss_bc * weight_bc, loss_pde * weight_pde, total
+
+    def forward(self, x: torch.Tensor):
+        if x.shape[1] == self.input_size:
+            return self.layer_stack(x)
+        else:
+            # Always encode on the SAME device as the input (not CPU), to avoid device mismatch in rff
+            x_50 = self.fourier_encoder_50(x)
+            x_2 = self.fourier_encoder_2(x)
+            X = torch.hstack((x_2, x_50))
+            return self.layer_stack(X)
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+
+# ------------------- Global Fourier Bases and Encoders -------------------
+# Create the global Fourier encoders 
+FREQUENCIES = [2, 50]
+ENCODED_SIZE = 2
+
+# Always use torch.float and CPU for bases
+B_2 = 2 * torch.randn(ENCODED_SIZE, 1, device='cpu', dtype=torch.float)
+B_50 = 50 * torch.randn(ENCODED_SIZE, 1, device='cpu', dtype=torch.float)
+FOURIER_ENCODER_2 = rff.layers.GaussianEncoding(b=B_2.cpu())
+FOURIER_ENCODER_50 = rff.layers.GaussianEncoding(b=B_50.cpu())
+FOURIER_ENCODERS = [FOURIER_ENCODER_2, FOURIER_ENCODER_50]
+
+
+def encode_data(x: torch.Tensor, encoders: list, device: str, dtype: torch.dtype) -> torch.Tensor:
+    """
+    Encode input x using a list of Fourier encoders and concatenate the results.
+    Args:
+        x: Input tensor of shape (N, 1)
+        encoders: List of rff.layers.GaussianEncoding objects
+        device: Target device (e.g., 'cpu' or 'cuda')
+        dtype: Target torch dtype
+    Returns:
+        Encoded tensor of shape (N, 2 * encoded_size * len(encoders))
+    """
+    encoded = [enc(x.cpu()).to(device=device, dtype=dtype) for enc in encoders]
+    return torch.hstack(encoded)
+
+# =============================================================================
+# Training Function
+# =============================================================================
+def train_PINN(
+    x_train: torch.Tensor,
+    u_train: torch.Tensor,
+    x_test: torch.Tensor,
+    u_test: torch.Tensor,
+    x_bc: torch.Tensor,
+    u_bc: torch.Tensor,
+    x_PDE: torch.Tensor,
+    fourier_encoders: list,
+    hidden_units: int = 100,
+    lr: float = 1e-4,
+    decay_rate: float = 0.96,
+    epochs_before_decay: int = 10000,
+    epochs: int = 50000,
+    weights: str = "static",
+    save_path: str = "models/pinn.pth"
+) -> tuple:
+    """
+    Train a PINN with Fourier embedding on the provided data.
+    Args:
+        x_train, u_train: Training data and targets
+        x_test, u_test: Test data and targets
+        x_bc, u_bc: Boundary condition data and targets
+        x_PDE: Collocation points for PDE loss
+        fourier_encoders: List of Fourier encoders
+        hidden_units: Number of hidden units in each layer
+        lr: Learning rate
+        decay_rate: Exponential decay rate for learning rate
+        epochs_before_decay: Epochs before each decay
+        epochs: Total number of epochs
+        weights: Loss weighting scheme
+        save_path: Path to save the trained model
+    Returns:
+        model: Trained PINN model
+        history: Dictionary with loss curves and predictions
+    """
+    encoded_size = fourier_encoders[0].b.shape[0]
+    input_size = 2 * encoded_size * len(fourier_encoders)
+    fourier_encoder_2 = fourier_encoders[0]
+    fourier_encoder_50 = fourier_encoders[1]
+
+    # Encode data as in the original code: encode on CPU, then move to device/DTYPE
+    x_train_50 = fourier_encoder_50(x_train.cpu()).to(device=device, dtype=DTYPE)
+    x_train_2 = fourier_encoder_2(x_train.cpu()).to(device=device, dtype=DTYPE)
+    x_train_encoded = torch.hstack((x_train_2, x_train_50))
+
+    x_test_50 = fourier_encoder_50(x_test.cpu()).to(device=device, dtype=DTYPE)
+    x_test_2 = fourier_encoder_2(x_test.cpu()).to(device=device, dtype=DTYPE)
+    x_test_encoded = torch.hstack((x_test_2, x_test_50))
+
+    x_bc_50 = fourier_encoder_50(x_bc.cpu()).to(device=device, dtype=DTYPE)
+    x_bc_2 = fourier_encoder_2(x_bc.cpu()).to(device=device, dtype=DTYPE)
+    x_bc_encoded = torch.hstack((x_bc_2, x_bc_50))
+
+    # Model
+    model = PINN(hidden_units=hidden_units, input_size=input_size, fourier_encoder_2=fourier_encoder_2, fourier_encoder_50=fourier_encoder_50)
+    model.apply(init_weights)
+    model = model.to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, amsgrad=False)
+    lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer=optimizer, gamma=decay_rate)
+
+    PDE_loss_values = []
+    train_loss_values = []
+    total_loss_values = []
+    test_loss_values = []
+    BC_loss_values = []
+    u_evolution = torch.zeros(x_test_encoded.shape[0], 1, device=device, dtype=DTYPE)
+    epoch_count = []
+
+    for epoch in range(epochs):
+        epoch_count.append(epoch)
+        model.train()
+        train_loss, BC_loss, PDE_loss, total_loss = model.loss(x_train_encoded, u_train, x_bc_encoded, u_bc, x_PDE, weights=weights)
+        PDE_loss_values.append(PDE_loss.item())
+        total_loss_values.append(total_loss.item())
+        train_loss_values.append(train_loss.item())
+        BC_loss_values.append(BC_loss.item())
+        optimizer.zero_grad()
+        total_loss.backward(retain_graph=True)
+        # Optional: Gradient clipping (uncomment to activate)
+        #clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        if epoch % epochs_before_decay == 0:
+            lr_scheduler.step()
+        if epoch % 500 == 0:
+            model.eval()
+            with torch.inference_mode():
+                u_pred = model.forward(x_test_encoded)
+                u_evolution = torch.hstack((u_evolution, u_pred.to(device=u_evolution.device, dtype=u_evolution.dtype)))
+                test_loss = model.loss_function(u_pred, u_test)
+            test_loss_values.append(test_loss)
+            print(f"Epoch: {epoch} | PDE loss: {PDE_loss:.5f} | Train loss: {train_loss:.5f} | BC loss: {BC_loss:.5f} | Total loss: {total_loss:.5f}\n")
+    print(f"Epoch: {epoch_count[-1]+1} | PDE loss: {PDE_loss_values[-1]:.5f} | Train loss: {train_loss_values[-1]:.5f} | BC loss: {BC_loss_values[-1]:.5f} | Total loss: {total_loss_values[-1]:.5f}\n")
+
+    # Save model
+    model_dir = Path(save_path).parent
+    model_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Saving model to: {save_path}")
+    torch.save(obj=model.state_dict(), f=save_path)
+
+    return model, {
+        'PDE_loss_values': PDE_loss_values,
+        'train_loss_values': train_loss_values,
+        'total_loss_values': total_loss_values,
+        'test_loss_values': test_loss_values,
+        'BC_loss_values': BC_loss_values,
+        'u_evolution': u_evolution,
+        'epoch_count': epoch_count,
+        'x_test_encoded': x_test_encoded
+    }
+
+# =============================================================================
+# Plotting Functions
+# =============================================================================
+def plot_results(x_train, u_train, x_test, u_test, u_hat, u_evolution, epoch_count, BC_loss_values, PDE_loss_values, total_loss_values, train_loss_values):
+    """Plot predictions, error, and loss curves."""
+    u_hat = u_hat.detach().cpu()
+    u_test = u_test.detach().cpu()
+    u_train = u_train.detach().cpu()
+    error = np.subtract(u_test, u_hat)
+
+    fig_1 = plt.figure(10)
+    plt.plot(x_train.detach().cpu(), u_train, label="Noisy data", color='red')
+    plt.plot(x_test.detach().cpu(), u_test, label="Exact", color='orange')
+    plt.plot(x_test.detach().cpu(), u_hat, label="Final estimate", linestyle='dashed', linewidth=1.2, color='k')
+    plt.title("u(x)")
+    plt.xlabel("x")
+    plt.ylabel("u(x)")
+    plt.legend()
+    plt.show()
+    fig_1.savefig('images/prediction')
+
+    fig_2 = plt.figure(20)
+    plt.plot(x_test.detach().cpu(), error)
+    plt.title("Point_wise_error")
+    plt.xlabel("x")
+    plt.ylabel("error")
+    plt.ticklabel_format(style='sci', axis='y')
+    plt.show()
+    fig_2.savefig('images/error')
+
+    fig_3 = plt.figure(100)
+    plt.semilogy(epoch_count, BC_loss_values, label="BC loss")
+    plt.semilogy(epoch_count, PDE_loss_values, label="PDE loss")
+    plt.semilogy(epoch_count, total_loss_values, label="total loss")
+    plt.semilogy(epoch_count, train_loss_values, label="train loss")
+    plt.title("Loss functions")
+    plt.xlabel("epochs")
+    plt.ylabel("losses")
+    plt.legend()
+    plt.show()
+    fig_3.savefig('images/loss_functions')
+
+# =============================================================================
+# Example Usage: Synthetic Data (Default)
+# =============================================================================
+def ground_truth(x: torch.Tensor) -> torch.Tensor:
+    """Ground truth function for synthetic data."""
+    return torch.sin(2*np.pi*x) + torch.mul(torch.sin(50*np.pi*x), 0.1)
+
+def prepare_synthetic_data(
+    x_min: float = 0.0,
+    x_max: float = 1.0,
+    N_train: int = 50,
+    N_test: int = 200,
+    Nf: int = 1000,
+    device: str = device,
+    dtype: torch.dtype = DTYPE
+) -> tuple:
+    """
+    Prepare synthetic data for the PINN example.
+    Returns:
+        x_train, u_train, x_test, u_test, x_bc, u_bc, x_PDE
+    """
+    x_train = torch.linspace(x_min, x_max, N_train).view(-1,1)
+    x_test = torch.linspace(x_min, x_max, N_test).view(-1,1)
+    x_PDE = torch.from_numpy(x_min + (x_max - x_min) * lhs(1, Nf)).type(torch.float).to(device)
+    x_bc = torch.Tensor([x_min, x_max]).view(-1,1).type(torch.float)
+
+    # Move to device
+    x_train = x_train.to(device)
+    x_test = x_test.to(device)
+    x_bc = x_bc.to(device)
+
+    # Generate targets
+    u_train = ground_truth(x_train)
+    u_test = ground_truth(x_test)
+    u_bc = torch.Tensor([0, 0]).view(-1, 1).type(torch.float).to(device)
+
+    # Add noise to training data
+    noise = torch.randn(u_train.shape[0], 1, device=device)
+    u_train = u_train + noise
+
+    # Move all input data to device and dtype BEFORE encoding
+    x_train = x_train.to(device=device, dtype=dtype)
+    x_test = x_test.to(device=device, dtype=dtype)
+    x_bc = x_bc.to(device=device, dtype=dtype)
+    x_PDE = x_PDE.to(device=device, dtype=dtype)
+    u_train = u_train.to(device=device, dtype=dtype)
+    u_test = u_test.to(device=device, dtype=dtype)
+    u_bc = u_bc.to(device=device, dtype=dtype)
+
+    return x_train, u_train, x_test, u_test, x_bc, u_bc, x_PDE
+
+
+
+if __name__ == "__main__":
+    # Prepare synthetic data
+    x_train, u_train, x_test, u_test, x_bc, u_bc, x_PDE = prepare_synthetic_data()
+
+    # Use the global Fourier encoders (created after seeding, before any data/noise/model)
+    fourier_encoders = FOURIER_ENCODERS
+
+    # ---------------------- Train the PINN ----------------------
+    model, history = train_PINN(
+        x_train, u_train, x_test, u_test, x_bc, u_bc, x_PDE,
+        fourier_encoders=fourier_encoders,
+        hidden_units=100,
+        lr=1e-4,
+        decay_rate=0.96,
+        epochs_before_decay=10000,
+        epochs=50000,
+        weights="static",
+        save_path="models/pinn.pth"
     )
 
+    # ---------------------- Plot Results ----------------------
+    u_hat = model.forward(history['x_test_encoded'].to(device))
+
+    # Plot true u(x) for comparison
+    import matplotlib.pyplot as plt
+    plt.figure()
+    plt.plot(x_test.cpu().numpy(), ground_truth(x_test).cpu().numpy(), label="True u(x)", color="orange", linewidth=2)
+    plt.plot(x_test.cpu().numpy(), u_hat.cpu().numpy(), label="PINN prediction", color="k", linestyle="dashed")
+    plt.scatter(x_train.cpu().numpy(), u_train.cpu().numpy(), label="Noisy train data", color="red", s=10)
+    plt.title("PINN vs True Solution")
+    plt.xlabel("x")
+    plt.ylabel("u(x)")
+    plt.legend()
+    plt.show()
+
+    plot_results(
+        x_train, u_train, x_test, u_test, u_hat, history['u_evolution'],
+        history['epoch_count'], history['BC_loss_values'], history['PDE_loss_values'],
+        history['total_loss_values'], history['train_loss_values']
+    )
 
-
-  def lossTrain(self, x_train, u_train):
-      loss_train = self.loss_function(self.forward(x_train), u_train)
-      return(loss_train)
-
-  def lossBC(self, x_bc, u_bc):
-      loss_bc = self.loss_function(self.forward(x_bc), u_bc)
-      return(loss_bc)
-
-  # Loss PDE
-  def lossPDE(self, x_PDE):
-    x = x_PDE.clone().detach().requires_grad_(True)   # create a detached clone for differentiation
-    u = self.forward(x.type(torch.float))
-    u_x = autograd.grad(u, x, torch.ones_like(u).to(device), retain_graph=True, create_graph=True)[0]  # first derivative
-    u_xx = autograd.grad(u_x, x, torch.ones_like(u_x).to(device), create_graph=True)[0]  # second derivative
-    f = u_xx + torch.mul(torch.sin(2*np.pi*x), 4*np.pi**2) + torch.mul(torch.sin(50*np.pi*x), 250*np.pi**2)
-    return self.loss_function(f, torch.zeros(f.shape[0], 1).to(device)) # make sure the target has the same shape as f
-
-  def loss(self, x_train, u_train, x_bc, u_bc,  x_PDE):
-
-      loss_pde = self.lossPDE(x_PDE)
-      loss_bc = self.lossBC(x_bc, u_bc)
-      loss_train = self.lossTrain(x_train, u_train)
-
-      match WEIGHTS:
-          case "static":
-              weight_pde = 1e-2
-              weight_bc = 1e6
-              weight_train = 1
-              return loss_train * weight_train, loss_bc * weight_bc, loss_pde * weight_pde, (loss_pde * weight_pde + loss_train * weight_train + loss_bc * weight_bc)
-
-          case "adaptive simple":
-            weight_pde = loss_pde/(loss_pde + loss_train + loss_bc)
-            weight_bc = loss_bc/(loss_pde + loss_train + loss_bc)
-            weight_train = loss_train/(loss_pde + loss_train + loss_bc)
-            return loss_train*weight_train, loss_bc*weight_bc, loss_pde*weight_pde, (loss_pde*weight_pde + loss_train*weight_train + loss_bc*weight_bc)
-
-  def forward(self, x: torch.Tensor):
-      if x.shape[1] == self.input_size:
-          return self.layer_stack(x)
-      else:
-          # Always encode on CPU, then move to device/dtype
-          x_cpu = x.cpu()
-          x_50 = fourier_encoder_50(x_cpu).to(x.device, dtype=x.dtype)
-          x_2 = fourier_encoder_2(x_cpu).to(x.device, dtype=x.dtype)
-          X = torch.hstack((x_2, x_50))
-          return self.layer_stack(X)
-
-
-#------------------------- train the neural network ------------------------------------
-# (Do not set dtype or seed again after model creation/init!)
-
-HIDDEN_UNITS = 100
-LR = 1e-4
-DECAY_RATE = 0.96
-EPOCHS_BEFORE_DECAY = 10000
-EPOCHS = 50000
-ENCODED_SIZE = 2
-INPUT_SIZE = 4*ENCODED_SIZE
-WEIGHTS = "static"
-
-
-# Move all input data to device and dtype BEFORE encoding
-
-# Move all input data to device and dtype BEFORE encoding
-x_train = x_train.to(device=device, dtype=DTYPE)
-x_test = x_test.to(device=device, dtype=DTYPE)
-x_bc = x_bc.to(device=device, dtype=DTYPE)
-x_PDE = x_PDE.to(device=device, dtype=DTYPE)
-u_train = u_train.to(device=device, dtype=DTYPE)
-u_test = u_test.to(device=device, dtype=DTYPE)
-u_bc = u_bc.to(device=device, dtype=DTYPE)
-
-# --- Deterministic Fourier bases: always sample on CPU, then move to device ---
-B_50 = 50 * torch.randn(ENCODED_SIZE, 1, device='cpu', dtype=DTYPE)
-B_2 = 2 * torch.randn(ENCODED_SIZE, 1, device='cpu', dtype=DTYPE)
-
-# Always keep Fourier bases on CPU for encoding, as rff expects both input and basis on the same device (CPU)
-B_50_cpu = B_50.cpu()
-B_2_cpu = B_2.cpu()
-fourier_encoder_50 = rff.layers.GaussianEncoding(b=B_50_cpu)
-fourier_encoder_2 = rff.layers.GaussianEncoding(b=B_2_cpu)
-
-
-
-# Always encode on CPU, ensure both input and basis are on CPU, then move to device/dtype
-x_test_50 = fourier_encoder_50(x_test.cpu()).to(device=device, dtype=DTYPE)
-x_test_2 = fourier_encoder_2(x_test.cpu()).to(device=device, dtype=DTYPE)
-x_test_encoded = torch.hstack((x_test_2, x_test_50))
-
-x_train_50 = fourier_encoder_50(x_train.cpu()).to(device=device, dtype=DTYPE)
-x_train_2 = fourier_encoder_2(x_train.cpu()).to(device=device, dtype=DTYPE)
-x_train_encoded = torch.hstack((x_train_2, x_train_50))
-
-x_bc_50 = fourier_encoder_50(x_bc.cpu()).to(device=device, dtype=DTYPE)
-x_bc_2 = fourier_encoder_2(x_bc.cpu()).to(device=device, dtype=DTYPE)
-x_bc_encoded = torch.hstack((x_bc_2, x_bc_50))
-
-
-#u_train = torch.vstack((u_train, u_train))
-#u_test = torch.vstack((u_test, u_test))
-
-
-# send data to GPU
-x_train = x_train.to(device).type(torch.float)
-x_PDE = x_PDE.to(device).type(torch.float)
-x_test = x_test.to(device).type(torch.float)
-x_bc = x_bc.to(device).type(torch.float)
-x_train_encoded = x_train_encoded.to(device).type(torch.float)
-x_test_encoded = x_test_encoded.to(device).type(torch.float)
-x_bc_encoded = x_bc_encoded.to(device).type(torch.float)
-
-
-u_train = u_train.to(device).type(torch.float)
-u_test = u_test.to(device).type(torch.float)
-u_bc = u_bc.to(device).type(torch.float)
-
-torch.manual_seed(42) # pseudo-randomization for reproducible code
-torch.set_default_dtype(torch.float)
-
-
-# creating an instance of the PINN with deterministic initialization
-# Always initialize and apply weights on CPU, then move to GPU for full determinism
-model = PINN(hidden_units=HIDDEN_UNITS, input_size=INPUT_SIZE)
-model.apply(init_weights)
-model = model.to(device)
-#print(model)
-
-# defining an optimizer and learning rate
-optimizer = torch.optim.Adam(model.parameters(), lr=LR, amsgrad=False)
-#optimizer = torch.optim.SGD(model.parameters(), lr=LR, momentum=0.9)
-lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer=optimizer, gamma=DECAY_RATE)
-
-# define empty lists to track the value of the losses
-PDE_loss_values = []
-train_loss_values = []
-total_loss_values = []
-test_loss_values = []
-BC_loss_values = []
-
-u_evolution = torch.zeros(x_test_encoded.shape[0], 1, device=device, dtype=DTYPE)
-
-epoch_count = []
-
-for epoch in range(EPOCHS):
-
-    # keeping track of the number of epoch
-    epoch_count.append(epoch)
-
-    PDE_loss = 0
-    total_loss = 0
-    train_loss = 0
-    BC_loss = 0
-
-    # Training
-    model.train()
-
-    # calculate the losses
-    #PDE_loss += model.lossPDE(x_PDE).item()
-    #BC_loss += model.lossBC(x_BC, u_BC).item()
-    train_loss, BC_loss, PDE_loss, total_loss = model.loss(x_train_encoded, u_train, x_bc_encoded, u_bc, x_PDE)
-
-    PDE_loss_values.append(PDE_loss.item())
-    total_loss_values.append(total_loss.item())
-    train_loss_values.append(train_loss.item())
-    BC_loss_values.append(BC_loss.item())
-
-    # setting to zero the gradients
-    optimizer.zero_grad()
-
-    # backward propagation and optimization
-    total_loss.backward(retain_graph=True)
-    # Optional: Gradient clipping (uncomment to activate)
-    #clip_grad_norm_(model.parameters(), 1.0)
-    optimizer.step()
-
-    # adjusting the learning rate
-    if epoch % EPOCHS_BEFORE_DECAY == 0:
-        lr_scheduler.step()
-
-
-    if epoch % 500 == 0:
-
-       # Testing
-        test_loss = 0
-        model.eval()  # put model in eval mode
-
-        # Turn on inference context manager
-        with torch.inference_mode():
-
-                # Forward pass
-                u_pred = model.forward(x_test_encoded)
-                # Ensure both tensors are on the same device and dtype before stacking
-                u_evolution = torch.hstack((u_evolution, u_pred.to(device=u_evolution.device, dtype=u_evolution.dtype)))
-
-                # Calculate loss
-                test_loss = model.loss_function(u_pred, u_test)
-
-        test_loss_values.append(test_loss)
-
-        print(f"Epoch: {epoch} | PDE loss: {PDE_loss:.5f} | Train loss: {train_loss:.5f} | BC loss: {BC_loss:.5f} | Total loss: {total_loss:.5f}\n")
-
-print(f"Epoch: {epoch_count[-1]+1} | PDE loss: {PDE_loss_values[-1]:.5f} | Train loss: {train_loss_values[-1]:.5f} | BC loss: {BC_loss_values[-1]:.5f} | Total loss: {total_loss_values[-1]:.5f}\n")
-
-#---------------------------------- Plotting the results -------------------------------------
-u_hat = model.forward(x_test_encoded.to(device))
-
-u_hat = u_hat.detach().cpu()
-u_test = u_test.detach().cpu()
-u_train = u_train.detach().cpu()
-
-error = np.subtract(u_test, u_hat)
-
-fig_1 = plt.figure(10)
-plt.plot(x_train.detach().cpu(), u_train, label="Noisy data", color='red')
-plt.plot(x_test.detach().cpu(), u_test, label="Exact", color='orange')
-plt.plot(x_test.detach().cpu(), u_hat, label="Final estimate", linestyle='dashed', linewidth=1.2, color='k')
-#plt.plot(x_test.detach().cpu(), u_evolution[:, 1], label="500 epochs", linestyle='dashed', color='b')
-#plt.plot(x_test.detach().cpu(), u_evolution[:, 2], label="1000 epochs", linestyle='dashed', color='red')
-plt.title("u(x)")
-plt.xlabel("x")
-plt.ylabel("u(x)")
-plt.legend()
-plt.show()
-fig_1.savefig('images/prediction')
-
-
-fig_2 = plt.figure(20)
-plt.plot(x_test.detach().cpu(), error)
-plt.title("Point_wise_error")
-plt.xlabel("x")
-plt.ylabel("error")
-plt.ticklabel_format(style='sci', axis='y')
-plt.show()
-fig_2.savefig('images/error')
-
-fig_3 = plt.figure(100)
-plt.semilogy(epoch_count, BC_loss_values, label="BC loss")
-plt.semilogy(epoch_count, PDE_loss_values, label="PDE loss")
-plt.semilogy(epoch_count, total_loss_values, label="total loss")
-plt.semilogy(epoch_count, train_loss_values, label="train loss")
-plt.title("Loss functions")
-plt.xlabel("epochs")
-plt.ylabel("losses")
-plt.legend()
-plt.show()
-fig_3.savefig('images/loss_functions')
-
-#--------------------------------- Save the model ------------------------------------------------
-
-from pathlib import Path
-
-# 1. Create models directory
-MODEL_PATH = Path("models")
-MODEL_PATH.mkdir(parents=True, exist_ok=True)
-
-# 2. Create model save path
-MODEL_NAME = "pinn.pth"
-MODEL_SAVE_PATH = MODEL_PATH / MODEL_NAME
-
-# 3. Save the model state dict
-print(f"Saving model to: {MODEL_SAVE_PATH}")
-torch.save(obj=model.state_dict(), # only saving the state_dict() only saves the models learned parameters
-           f=MODEL_SAVE_PATH)
-
-# Debug: print model and tensor device/dtype
-print(f"Model device: {next(model.parameters()).device}, dtype: {next(model.parameters()).dtype}")
-print(f"x_train_encoded device: {x_train_encoded.device}, dtype: {x_train_encoded.dtype}")

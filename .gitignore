@@ -1,3 +1,5 @@
 .venv/
 __pycache__/
 models/
+plotting_functions.py
+requirements.txt
