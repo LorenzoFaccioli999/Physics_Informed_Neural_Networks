@@ -1,46 +1,83 @@
-# Physics-Informed Neural Networks for Multi-Scale Multi-Frequency PDEs
+# Physics-Informed Neural Networks with Fourier Embedding
 
-This repository provides a comprehensive implementation of Physics-Informed Neural Networks (PINNs) tailored to solve complex partial differential equations (PDEs) characterized by multi-scale and multi-frequency behaviors. It contains two main applications: one utilizing adaptive weighting schemes to stabilize training across heterogeneous loss components, and another leveraging Fourier feature embeddings to address spectral bias and improve the learning of high-frequency components.
+![prediction](images/prediction.png)
 
-## Problem Overview
+This repository provides a modular, user-friendly implementation of Physics-Informed Neural Networks (PINNs) for solving 1D partial differential equations (PDEs) with multi-scale and multi-frequency behavior. The main focus is on overcoming spectral bias using Fourier feature embeddings, enabling the network to efficiently learn both low- and high-frequency components from noisy or limited data.
 
-Traditional neural networks often struggle with PDEs involving rapidly oscillating or multi-frequency solutions due to **spectral bias**, which causes a preference for learning low-frequency features first. Additionally, imbalanced contributions in loss terms (e.g., data fidelity vs. physical residuals) can hinder convergence. These challenges are especially pronounced in noisy data environments or when labeled data is scarce.
+## Features
 
-## Methodology
+- Modular, well-commented code for easy customization
+- Deterministic and reproducible results (random seeds, device, and dtype handling)
+- User can specify their own data, domain, collocation points, and Fourier frequencies
+- Example usage with synthetic data included
+- Easy to adapt to new PDEs and datasets
 
-### Fourier Feature Embedding
+## How to Use
 
-To mitigate spectral bias in learning high-frequency functions, Fourier embeddings are applied to the input domain:
-- Inputs are mapped to a higher-dimensional space using sinusoidal transformations.
-- Encodings with multiple frequency scales are concatenated to enable learning of both low and high-frequency components simultaneously.
-- The resulting network efficiently reconstructs multi-scale functions with minimal training data and demonstrates robustness to noise.
+### 1. Install Dependencies
 
-### Benefits of Fourier Embedding
+Install the required Python packages individually (recommended for full control):
 
-- **Enhanced frequency resolution:** Empirically and theoretically shown to enable learning of high-frequency components by transforming the Neural Tangent Kernel (NTK).
-- **Faster convergence:** Enables more uniform learning dynamics across spectral components.
-- **Robustness to noise:** Maintains high fidelity in function approximation despite training data corruption.
-- **Multi-scale capacity:** Combined embeddings adapt to different frequency bands without manual tuning of frequency scales.
-
-### Governing Equation Example:
-$$
-\nabla_{xx} u(x) = f(x), \quad u(0) = u(1) = 0, \quad u(x) = \sin(2\pi x) + 0.1 \sin(50\pi x)
-$$
-
-This PDE is representative of systems exhibiting fine-grained oscillatory behavior. The objective of the Neural Network is to learn the function $f(x)$ from partial, noisy data. Results demonstrate significant improvements in solution accuracy and convergence behavior when using the multi-scale Fourier embedding technique, especially in the presence of noise or when modeling fine-resolution physics. For an in-depth analysis, see the [accompanying report](https://github.com/LorenzoFaccioli999/Physics_Informed_Neural_Networks/blob/main/PINN_report.pdf).
-
-## Code Structure
-
-- `pinn_fourier_embedding.py`: Solves 1D multi-scale multi-frequency PDE using Fourier feature embeddings.
-- `plotting_functions.py`: Utility for 2D/3D visualizations of the predicted and reference solutions.
-
-## Requirements
-
-- Python ≥ 3.8
-- PyTorch ≥ 1.11
-- NumPy, Matplotlib, Scikit-learn
-- `pyDOE`, `rff` (for Latin Hypercube Sampling and Fourier embeddings)
-
-Install dependencies using:
 ```bash
-pip install -r requirements.txt
+pip install torch numpy matplotlib pyDOE rff
+```
+
+If you want to use a CUDA-enabled GPU, install the correct PyTorch version for your system. Visit [PyTorch Get Started](https://pytorch.org/get-started/locally/) and select your CUDA version. For example, for CUDA 11.8:
+
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+```
+
+### 2. Run the Example
+
+To run the default synthetic example (multi-frequency PDE):
+
+```bash
+python PINN_Fourier_Embedding.py
+```
+
+This will train the PINN on a synthetic PDE and produce plots comparing the true solution, noisy data, and the PINN prediction.
+
+### 3. Setting Up Your Own Problem
+
+You can easily adapt the script to solve your own 1D PDE by modifying the following:
+
+#### a. Data and Domain
+- Replace the `prepare_synthetic_data` function with your own data loading/generation code.
+
+#### b. Fourier Frequencies
+- At the top of the script, change the `FREQUENCIES` and `ENCODED_SIZE` variables to set the desired Fourier bases. For example:
+  ```python
+  FREQUENCIES = [2, 10, 50]  # Add or remove frequencies as needed
+  ENCODED_SIZE = 2           # Number of random features per frequency
+  ```
+- The script will automatically use these frequencies for the Fourier embedding.
+
+#### c. PDE Definition
+- To solve a different PDE, modify the `lossPDE` method inside the `PINN` class. The line:
+  ```python
+  f = ...  # Define your PDE residual here
+  ```
+  should be replaced with the residual of your own PDE, using the computed derivatives (`u_x`, `u_xx`, etc.).
+- You can use `autograd.grad` to compute higher-order derivatives as needed.
+
+#### d. Training Parameters
+- Adjust the number of epochs, learning rate, hidden units, etc., in the call to `train_PINN` in the main block.
+
+### 4. Saving and Plotting
+
+- Trained models are saved in the `models/` directory.
+- Plots are saved in the `images/` directory and also displayed interactively.
+
+
+## Troubleshooting
+
+- If you encounter device or dtype errors, ensure all tensors are moved to the correct device and dtype before training.
+- For full determinism, keep the seeding and Fourier encoder creation order unchanged.
+
+## References
+
+- For theory and background, see the [accompanying report](https://github.com/LorenzoFaccioli999/Physics_Informed_Neural_Networks/blob/main/PINN_report.pdf).
+
+---
+For questions or contributions, please open an issue or pull request.
